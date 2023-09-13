@@ -88,3 +88,18 @@ for i in tqdm(range(0, len(fashion), batch_size)):
 
 # show index description after uploading the documents
 index.describe_index_stats()
+query = "dark blue french connection jeans for men"
+
+# create sparse and dense vectors
+sparse = bm25.transform_query(query)
+dense = model.encode(query).tolist()
+# search
+result = index.query(
+    top_k=14,
+    vector=dense,
+    sparse_vector=sparse,
+    include_metadata=True
+)
+# used returned product ids to get images
+imgs = [images[int(r["id"])] for r in result["matches"]]
+print(imgs)
