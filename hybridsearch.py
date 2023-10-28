@@ -7,11 +7,100 @@ from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
 from IPython.core.display import HTML
 from io import BytesIO
+import numpy as np
+from typing import List, Callable, Optional, Dict
+
+from sklearn.base import BaseEstimator
+from sklearn.feature_extraction.text import HashingVectorizer
 from base64 import b64encode
+SparseVector = Dict[str, List]
+
+
+class BM25(BaseEstimator):
+
+    def __init__(self, tokenizer: Callable[[str], List[str]], n_features=2 ** 16, b=0.75, k1=1.6):
+        """OKapi BM25 with HashingVectorizer
+
+        Args:
+            tokenizer: A function to converts text to a list of tokens
+            n_features: The number of features to hash to
+            b: BM25 parameters
+            k1: BM25 parameters
+        """
+        # Fixed params
+        self.n_features: int = n_features
+        self.b: float = b
+        self.k1: float = k1
+
+        self._tokenizer: Callable[[str], List[str]] = tokenizer
+        self._vectorizer = HashingVectorizer(
+            n_features=self.n_features,
+            token_pattern=None,
+            tokenizer=tokenizer, norm=None,
+            alternate_sign=False, binary=True)
+        # Learned Params
+        self.doc_freq: Optional[np.ndarray] = None
+        self.n_docs: Optional[int] = None
+        self.avgdl: Optional[float] = None
+
+    def fit(self, X: List[str], y=None) -> "BM25":
+        """Fit BM25 by calculating document frequency over the corpus"""
+        X = self._vectorizer.transform(X)
+        self.avgdl = X.sum(1).mean()
+        self.n_docs = X.shape[0]
+        self.doc_freq = X.sum(axis=0).A1
+        return self
+
+    def vectorize(self, text) -> SparseVector:
+        sparse_array = self._vectorizer.transform(text)
+        return {'indices': [int(x) for x in sparse_array.indices], 'values': sparse_array.data.tolist()}
+
+    def get_params(self, deep=True):
+        return {
+            'avgdl': self.avgdl,
+            'ndocs': self.n_docs,
+            'doc_freq': list(self.doc_freq),
+            'b': self.b,
+            'k1': self.k1,
+            'n_features': self.n_features
+        }
+
+    def set_params(self, **params):
+        self.avgdl = params['avgdl']
+        self.n_docs = params['ndocs']
+        self.doc_freq = np.array(params['doc_freq'])
+        self.b = params['b']
+        self.k1 = params['k1']
+        self.n_features = params['n_features']
+
+    def transform_doc(self, doc: str) -> SparseVector:
+        """Normalize document for BM25 scoring"""
+        doc_tf = self._vectorizer.transform([doc])
+        norm_doc_tf = self._norm_doc_tf(doc_tf)
+        return {'indices': [int(x) for x in doc_tf.indices], 'values': norm_doc_tf.tolist()}
+
+    def transform_query(self, query: str) -> SparseVector:
+        """Normalize query for BM25 scoring"""
+        query_tf = self._vectorizer.transform([query])
+        indices, values = self._norm_query_tf(query_tf)
+        return {'indices': [int(x) for x in indices], 'values': values.tolist()}
+
+    def _norm_doc_tf(self, doc_tf) -> np.ndarray:
+        """Calculate BM25 normalized document term-frequencies"""
+        b, k1, avgdl = self.b, self.k1, self.avgdl
+        tf = doc_tf.data
+        norm_tf = tf / (k1 * (1.0 - b + b * (tf.sum() / avgdl)) + tf)
+        return norm_tf
+
+    def _norm_query_tf(self, query_tf):
+        """Calculate BM25 normalized query term-frequencies"""
+        idf = np.log((self.n_docs + 1) / (self.doc_freq[query_tf.indices] + 0.5))
+        return query_tf.indices, idf / idf.sum()
+
 def display_result(image_batch):
     figures = []
     for img in image_batch:
-        b = BytesIO()  
+        b = BytesIO()
         img.save(b, format='png')
         figures.append(f'''
             <figure style="margin: 5px !important;">
@@ -26,7 +115,7 @@ def display_result(image_batch):
 
 # init connection to pinecone
 pinecone.init(
-    api_key='f4fa8f28-2f64-4e5b-a0c1-36c247b1fab6',  # app.pinecone.io
+    api_key='YOUR_API_KEY',  # app.pinecone.io
     environment='gcp-starter'  # find next to api key
 )
 index_name = "hybrid-image-search"
@@ -39,7 +128,7 @@ if index_name not in pinecone.list_indexes():
       metric="dotproduct",
       pod_type="s1"
     )
-index = pinecone.Index(index_name)    
+index = pinecone.Index(index_name)
 fashion = load_dataset(
     "ashraq/fashion-product-images-small",
     split="train"
@@ -51,13 +140,32 @@ images[9000]
 # convert metadata into a pandas dataframe
 metadata = metadata.to_pandas()
 metadata.head()
-with open('pinecone_text.py' ,'w') as fb:
-    fb.write(requests.get('https://storage.googleapis.com/gareth-pinecone-datasets/pinecone_text.py').text)
+
+def hybrid_scale(dense, sparse, alpha: float):
+    """Hybrid vector scaling using a convex combination
+
+    alpha * dense + (1 - alpha) * sparse
+
+    Args:
+        dense: Array of floats representing
+        sparse: a dict of `indices` and `values`
+        alpha: float between 0 and 1 where 0 == sparse only
+               and 1 == dense only
+    """
+    if alpha < 0 or alpha > 1:
+        raise ValueError("Alpha must be between 0 and 1")
+    # scale sparse and dense vectors to create hybrid search vecs
+    hsparse = {
+        'indices': sparse['indices'],
+        'values':  [v * (1 - alpha) for v in sparse['values']]
+    }
+    hdense = [v * alpha for v in dense]
+    return hdense, hsparse
+
 # load bert tokenizer from huggingface
 tokenizer = BertTokenizerFast.from_pretrained(
     'bert-base-uncased'
 )
-
 def tokenize_func(text):
     token_ids = tokenizer(
         text,
@@ -65,7 +173,7 @@ def tokenize_func(text):
     )['input_ids']
     return tokenizer.convert_ids_to_tokens(token_ids)
 
-bm25 = pinecone_text.BM25(tokenize_func)    
+bm25 = BM25(tokenize_func)
 tokenize_func('Turtle Check Men Navy Blue Shirt')
 bm25.fit(metadata['productDisplayName'])
 bm25.transform_query(metadata['productDisplayName'][0])
@@ -74,6 +182,7 @@ model = SentenceTransformer(
     'sentence-transformers/clip-ViT-B-32',
     device='cpu'
 )
+#insert the dataset in pinecone database
 # batch_size = 200
 
 # for i in tqdm(range(0, len(fashion), batch_size)):
@@ -107,19 +216,26 @@ model = SentenceTransformer(
 
 # show index description after uploading the documents
 index.describe_index_stats()
-query = "dark blue french connection jeans for men"
 
+# display the images
+query = "blue tshirt for mens"
 # create sparse and dense vectors
 sparse = bm25.transform_query(query)
 dense = model.encode(query).tolist()
+# scale sparse and dense vectors - keyword search first
+hdense, hsparse = hybrid_scale(dense, sparse, alpha=0.05)
 # search
 result = index.query(
     top_k=14,
-    vector=dense,
-    sparse_vector=sparse,
+    vector=hdense,
+    sparse_vector=hsparse,
     include_metadata=True
 )
 # used returned product ids to get images
 imgs = [images[int(r["id"])] for r in result["matches"]]
-print(imgs)
-print(display_result(imgs))
+# display the images
+display_result(imgs)
+
+
+
+
